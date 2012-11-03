@@ -383,3 +383,5 @@
 /modules/suggest/dist
 
 /modules/spatial/build/
+
+/maven-build

@@ -108,6 +108,12 @@ public interface FacetParams {
    */
   public static final String FACET_PIVOT_MINCOUNT = FACET_PIVOT + ".mincount";
 
+  public static final String FACET_PIVOT_LIMIT_METHOD = FACET_PIVOT + ".limit.method";
+  
+  public static final String FACET_PIVOT_LIMIT_IGNORE = FACET_PIVOT + ".limit.ignore";
+  
+  public static final String COMBINED_PIVOT_FACET_LIMIT = "combined";
+
   
   /**
    * String option: "count" causes facets to be sorted

@@ -17,6 +17,20 @@
 
 package org.apache.solr.handler.component;
 
+import java.io.IOException;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+
+import org.apache.commons.lang.StringUtils;
 import org.apache.lucene.queryparser.classic.ParseException;
 import org.apache.lucene.util.OpenBitSet;
 import org.apache.solr.common.SolrException;
@@ -29,15 +43,13 @@ import org.apache.solr.common.params.SolrParams;
 import org.apache.solr.common.util.NamedList;
 import org.apache.solr.common.util.SimpleOrderedMap;
 import org.apache.solr.common.util.StrUtils;
+import org.apache.solr.handler.component.PivotFacetHelper.PivotLimitInfo;
 import org.apache.solr.request.SimpleFacets;
 import org.apache.solr.schema.FieldType;
 import org.apache.solr.search.QueryParsing;
+import org.apache.solr.util.PivotListEntry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import java.io.IOException;
-import java.net.URL;
-import java.util.*;
 
 /**
  * TODO!
@@ -53,7 +65,7 @@ public class FacetComponent extends SearchComponent
 
   static final String PIVOT_KEY = "facet_pivot";
 
-  PivotFacetHelper pivotHelper;
+  protected PivotFacetHelper pivotHelper;
 
   @Override
   public void init( NamedList args )
@@ -290,6 +302,14 @@ public class FacetComponent extends SearchComponent
   private void countFacets(ResponseBuilder rb, ShardRequest sreq) {
     FacetInfo fi = rb._facetInfo;
 
+    SimpleOrderedMap<Map<Object,NamedList<Object>>> pivotFacetsMap = null;
+    SimpleOrderedMap<Map<Integer,Map<Object,Integer>>> fieldCountsMap = null;
+    boolean pivoting = false;
+    PivotLimitInfo limitInfo = null;
+    List<String> facetLimitIgnoreFieldList = null;
+    SimpleOrderedMap<List<Integer>> facetLimitIgnoreIndexsMap = null;
+    boolean sortByCount = false;
+    
     for (ShardResponse srsp: sreq.responses) {
       int shardNum = rb.getShardNum(srsp.getShard());
       NamedList facet_counts = null;
@@ -410,8 +430,132 @@ public class FacetComponent extends SearchComponent
           }
         }
       }
-    }
+      
+      // Distributed facet_pivots
+      //
+      // The implementation below uses the first encountered shard's
+      // facet_pivots as the basis for subsequent shards' data to be merged.
+      @SuppressWarnings("unchecked")
+      SimpleOrderedMap<List<NamedList<Object>>> facet_pivot = (SimpleOrderedMap<List<NamedList<Object>>>) facet_counts
+          .get("facet_pivot");
+      
+      if (facet_pivot != null) {
+        if (pivotFacetsMap == null) {
+          pivoting = true;
+          SolrParams params = rb.req.getParams();
+          String facetSort = params.get(FacetParams.FACET_SORT);
+          if (facetSort != null
+              && facetSort.equals(FacetParams.FACET_SORT_COUNT)) {
+            sortByCount = true;
+          }
+          limitInfo = new PivotLimitInfo();
+          limitInfo.limit = params.getInt(FacetParams.FACET_LIMIT, 0);
+          String facetLimitMethod = params
+              .get(FacetParams.FACET_PIVOT_LIMIT_METHOD);
+          if (facetLimitMethod != null
+              && facetLimitMethod
+                  .equals(FacetParams.COMBINED_PIVOT_FACET_LIMIT)) {
+            limitInfo.combinedPivotLimit = true;
+            fieldCountsMap = new SimpleOrderedMap<Map<Integer,Map<Object,Integer>>>();
+            facetLimitIgnoreIndexsMap = new SimpleOrderedMap<List<Integer>>();
+          }
+          String facetLimitIgnores = params
+              .get(FacetParams.FACET_PIVOT_LIMIT_IGNORE);
+          if (facetLimitIgnores != null) {
+            facetLimitIgnoreFieldList = Arrays.asList(facetLimitIgnores
+                .split(","));
+          }
+          pivotFacetsMap = new SimpleOrderedMap<Map<Object,NamedList<Object>>>();
+        }
 
+        // go through each facet_pivot
+        for (Map.Entry<String,List<NamedList<Object>>> pivot : facet_pivot) {
+          final String pivotName = pivot.getKey();
+          final Integer numberOfPivots;
+          if (facetLimitIgnoreFieldList != null) {
+            List<Integer> facetLimitIgnoreIndexList = new ArrayList<Integer>();
+            List<String> pivotFields = Arrays.asList(pivotName.split(","));
+            for (String facetLimitIgnore : facetLimitIgnoreFieldList) {
+              int thisIndex = pivotFields.indexOf(facetLimitIgnore);
+              if (thisIndex > -1) {
+                // Add one here because pivots start from 1, whereas list indexs
+                // start from 0
+                facetLimitIgnoreIndexList.add(thisIndex + 1);
+              }
+            }
+            facetLimitIgnoreIndexsMap.add(pivotName, facetLimitIgnoreIndexList);
+            numberOfPivots = pivotFields.size();
+          } else {
+            numberOfPivots = 1 + StringUtils.countMatches(pivotName, ",");
+          }
+          Map<Integer,Map<Object,Integer>> fieldCounts = null;
+          if (limitInfo.combinedPivotLimit) {
+            fieldCounts = fieldCountsMap.get(pivotName);
+            if (fieldCounts == null) {
+              fieldCounts = new HashMap<Integer,Map<Object,Integer>>();
+              fieldCountsMap.add(pivotName, fieldCounts);
+            }
+          }
+          Map<Object,NamedList<Object>> pivotValues = pivotFacetsMap
+              .get(pivotName);
+          if (pivotValues == null) {
+            // first time we've seen this pivot, no merging
+            pivotFacetsMap.add(pivotName, pivotHelper.convertPivotsToMaps(
+                pivot.getValue(), 1, numberOfPivots, fieldCounts));
+            
+          } else {
+            // not the first time, merge
+            
+            @SuppressWarnings("unchecked")
+            List<NamedList<Object>> shardPivotValues = (List<NamedList<Object>>) pivot
+                .getValue();
+            
+            mergePivotFacet(pivotValues, shardPivotValues, 1, numberOfPivots,
+                fieldCounts);
+          }
+        }
+      }
+      
+    }
+    
+    // set pivot facets from map
+    
+    if (pivoting) {
+      if (limitInfo.combinedPivotLimit) {
+        Comparator<Entry<Object,Integer>> entryCountComparator = new EntryCountComparator();
+        limitInfo.fieldLimitsMap = new SimpleOrderedMap<List<List<Object>>>();
+        for (Entry<String,Map<Integer,Map<Object,Integer>>> fieldCountsEntry : fieldCountsMap) {
+          List<Integer> facetLimitIgnoreIndexs = facetLimitIgnoreIndexsMap
+              .get(fieldCountsEntry.getKey());
+          List<List<Object>> limitedValuesForPivot = new ArrayList<List<Object>>();
+          Integer pivot = 1;
+          Map<Object,Integer> fieldCountsForPivot = fieldCountsEntry.getValue()
+              .get(pivot);
+          while (fieldCountsForPivot != null) {
+            List<Object> limitedValuesForField = null;
+            if ((facetLimitIgnoreIndexs == null || !facetLimitIgnoreIndexs
+                .contains(pivot))
+                && fieldCountsForPivot.size() > limitInfo.limit) {
+              limitedValuesForField = new ArrayList<Object>();
+              List<Entry<Object,Integer>> fieldCountsForPivotList = new ArrayList<Map.Entry<Object,Integer>>(
+                  fieldCountsForPivot.entrySet());
+              Collections.sort(fieldCountsForPivotList, entryCountComparator);
+              for (int valueIndex = 0; valueIndex < limitInfo.limit; valueIndex++) {
+                limitedValuesForField.add(fieldCountsForPivotList.get(
+                    valueIndex).getKey());
+              }
+            }
+            limitedValuesForPivot.add(limitedValuesForField);
+            fieldCountsForPivot = fieldCountsEntry.getValue().get(++pivot);
+          }
+          limitInfo.fieldLimitsMap.add(fieldCountsEntry.getKey(),
+              limitedValuesForPivot);
+        }
+      }
+      fi.pivotFacets = pivotHelper.convertPivotMapsToList(pivotFacetsMap,
+          limitInfo, sortByCount);
+    }
+    
     //
     // This code currently assumes that there will be only a single
     // request ((with responses from all shards) sent out to get facets...
@@ -478,7 +622,87 @@ public class FacetComponent extends SearchComponent
     }
   }
 
+  private void mergePivotFacet(Map<Object,NamedList<Object>> pivotValues,
+      List<NamedList<Object>> shardPivotValues, int currentPivot,
+      int numberOfPivots, Map<Integer,Map<Object,Integer>> fieldCounts) {
+    pivotHelper = new PivotFacetHelper();
 
+
+    Iterator<NamedList<Object>> shardPivotValuesIterator = shardPivotValues
+        .iterator();
+    boolean countFields = (fieldCounts != null);
+    Map<Object,Integer> thisFieldCountMap = null;
+    if (countFields) {
+      thisFieldCountMap = pivotHelper.getFieldCountMap(fieldCounts,
+          currentPivot);
+    }
+    while (shardPivotValuesIterator.hasNext()) {
+      NamedList<Object> shardPivotValue = shardPivotValuesIterator.next();
+      Object valueObj = pivotHelper.getFromPivotList(PivotListEntry.VALUE,
+          shardPivotValue);
+      Object shardCountObj = pivotHelper.getFromPivotList(
+          PivotListEntry.COUNT, shardPivotValue);
+      int shardCount = 0;
+      if (shardCountObj instanceof Integer) {
+        shardCount = (Integer) shardCountObj;
+      }
+      if (countFields) {
+        pivotHelper.addFieldCounts(valueObj, shardCount, thisFieldCountMap);
+      }
+      NamedList<Object> pivotValue = pivotValues.get(valueObj);
+      if (pivotValue == null) {
+        // pivot value not found, add to existing values
+        pivotValues.put(valueObj, shardPivotValue);
+        if (currentPivot < numberOfPivots) {
+          int pivotIdx = shardPivotValue.indexOf(
+              PivotListEntry.PIVOT.getName(), 0);
+          Object shardPivotObj = shardPivotValue.getVal(pivotIdx);
+          if (shardPivotObj instanceof List) {
+            shardPivotValue.setVal(pivotIdx, pivotHelper.convertPivotsToMaps(
+                (List) shardPivotObj, currentPivot + 1, numberOfPivots, fieldCounts));
+          }
+        }
+      } else {
+        Object existingCountObj = pivotHelper.getFromPivotList(
+            PivotListEntry.COUNT, pivotValue);
+        if (existingCountObj instanceof Integer) {
+          int countIdx = pivotValue.indexOf(PivotListEntry.COUNT.getName(), 0);
+          pivotValue
+              .setVal(countIdx, ((Integer) existingCountObj) + shardCount);
+        } else {
+          StringBuffer errMsg = new StringBuffer(
+              "Count value for pivot field: ");
+          errMsg.append(pivotHelper.getFromPivotList(PivotListEntry.FIELD,
+              pivotValue));
+          errMsg.append(" with value: ");
+          errMsg.append(pivotHelper.getFromPivotList(PivotListEntry.VALUE,
+              pivotValue));
+          errMsg
+              .append(
+                  " is not of type Integer. Cannot increment count for this pivot. Count is of type: ");
+          errMsg.append(existingCountObj.getClass().getCanonicalName());
+          errMsg.append(" and value: ").append(existingCountObj);
+          log.error(errMsg.toString());
+        }
+        if (currentPivot < numberOfPivots) {
+          Object shardPivotObj = shardPivotValue.get("pivot");
+          Object pivotObj = pivotValue.get("pivot");
+          if (shardPivotObj instanceof List) {
+            if (pivotObj instanceof Map) {
+              mergePivotFacet((Map) pivotObj, (List) shardPivotObj,
+                  currentPivot + 1, numberOfPivots, fieldCounts);
+            } else {
+              pivotValue.add("pivot", pivotHelper.convertPivotsToMaps(
+                  (List) shardPivotObj, currentPivot + 1, numberOfPivots,
+                  fieldCounts));
+            }
+          }
+        }
+        shardPivotValuesIterator.remove();
+      }
+    }
+  }
+  
   private void refineFacets(ResponseBuilder rb, ShardRequest sreq) {
     FacetInfo fi = rb._facetInfo;
 
@@ -587,6 +811,9 @@ public class FacetComponent extends SearchComponent
 
     facet_counts.add("facet_dates", fi.dateFacets);
     facet_counts.add("facet_ranges", fi.rangeFacets);
+    if (fi.pivotFacets != null && fi.pivotFacets.size()>0) {
+      facet_counts.add("facet_pivot", fi.pivotFacets);
+    }
 
     rb.rsp.add("facet_counts", facet_counts);
 
@@ -635,6 +862,7 @@ public class FacetComponent extends SearchComponent
       = new SimpleOrderedMap<SimpleOrderedMap<Object>>();
     public SimpleOrderedMap<SimpleOrderedMap<Object>> rangeFacets
       = new SimpleOrderedMap<SimpleOrderedMap<Object>>();
+    public SimpleOrderedMap<List<NamedList<Object>>> pivotFacets;
 
     void parse(SolrParams params, ResponseBuilder rb) {
       queryFacets = new LinkedHashMap<String,QueryFacet>();
